@@ -1,0 +1,40 @@
+{
+  "private": true,
+  "name": "paper-plane-server",
+  "version": "0.1.0",
+  "description": "Colyseus multiplayer server for Paper Plane",
+  "type": "module",
+  "main": "build/index.js",
+  "engines": {
+    "node": ">= 22.0.0"
+  },
+  "scripts": {
+    "start": "tsx watch src/index.ts",
+    "loadtest": "tsx loadtest/example.ts --room lobby --numClients 2",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "clean": "rimraf build",
+    "test": "mocha -r tsx test/**.test.ts --exit --timeout 15000"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@colyseus/loadtest": "^0.18.1",
+    "@colyseus/sdk": "^0.18.1",
+    "@colyseus/testing": "^0.18.5",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/mocha": "^10.0.1",
+    "mocha": "^11.7.5",
+    "rimraf": "^5.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.0.4"
+  },
+  "dependencies": {
+    "@colyseus/schema": "^5.0.14",
+    "@colyseus/tools": "^0.18.1",
+    "colyseus": "^0.18.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "mongodb": "^6.10.0"
+  }
+}
