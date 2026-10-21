@@ -261,13 +261,13 @@ describe("LobbyRoom", () => {
 
   it("broadcasts a leaderboard merging online players with saved offline ones", async () => {
     const fake = fakePlayersCollection([
-      baseDoc({ _id: "off1", username: "OfflineAce", power: 9000, level: 40, playTime: 7200, wins: 100 }),
+      baseDoc({ _id: "off1", username: "OfflineAce", power: 9000, level: 40, playTime: 7200, wins: 100, rebirths: 4 }),
       baseDoc({ _id: "u1", username: "Me", power: 1 }), // online below -- must not duplicate
     ]);
     __setPlayersForTest(fake);
     const room = await colyseus.createRoom<LobbyState>("lobby", {});
     const client1 = await colyseus.connectTo(room, { userId: "u1", username: "Me" });
-    client1.send("stats", { power: 500, wins: 3 });
+    client1.send("stats", { power: 500, wins: 300, rebirths: 2 });
     await room.waitForNextPatch();
 
     const board: any = await new Promise((resolve) => {
@@ -275,18 +275,19 @@ describe("LobbyRoom", () => {
       void (room as any).refreshLeaderboard();
     });
     assert.deepStrictEqual(
-      board.power.map((r: any) => [r.name, r.value]),
-      [["OfflineAce", 9000], ["Me", 500]],
+      board.rebirths.map((r: any) => [r.name, r.value]),
+      [["OfflineAce", 4], ["Me", 2]],
     );
-    assert.strictEqual(board.power.filter((r: any) => r.name === "Me").length, 1);
-    assert.strictEqual(board.wins[0].name, "OfflineAce");
-    // Level board: derived from power server-side (500 power -> level > 1), offline row first.
-    assert.strictEqual(board.level[0].name, "OfflineAce");
-    assert.ok(board.level.find((r: any) => r.name === "Me").value > 1);
+    assert.strictEqual(board.rebirths.filter((r: any) => r.name === "Me").length, 1);
+    // Online live value beats the stale saved one; ranked above the offline row.
+    assert.deepStrictEqual(
+      board.wins.map((r: any) => [r.name, r.value]),
+      [["Me", 300], ["OfflineAce", 100]],
+    );
     assert.strictEqual(board.playTime[0].value, 7200);
-    assert.ok(board.power[1].id === client1.sessionId, "own row keeps the session id");
-    assert.ok(board.power[0].id.startsWith("offline:"), "offline rows never expose the real id");
-    assert.deepStrictEqual(Object.keys(board).sort(), ["level", "playTime", "power", "wins"]);
+    assert.ok(board.rebirths[1].id === client1.sessionId, "own row keeps the session id");
+    assert.ok(board.rebirths[0].id.startsWith("offline:"), "offline rows never expose the real id");
+    assert.deepStrictEqual(Object.keys(board).sort(), ["playTime", "rebirths", "wins"]);
   });
 
   it("counts server-measured playtime for signed-in players and persists it with $inc", async () => {

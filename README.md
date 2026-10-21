@@ -77,7 +77,7 @@ every owned id. A payload without a `pets` array leaves the saved pets untouched
 |---|---|---|
 | `progress` | saved doc: `{ power, level, playTime, rebirths, wins, bestDistance, furthestZone, ownedPlanes, equippedPlane, pets, equipped, discovered, nextPetId }` | after a signed-in join/identify, if a saved doc exists |
 | `noProgress` | `{}` | after a signed-in join/identify, for an account with no save yet |
-| `leaderboard` | `{ level, playTime, power, wins }`, each `Row[]` with `Row = { id, name, value }` | every 15s and on roster changes; live roster merged with all-time Mongo top scorers |
+| `leaderboard` | `{ rebirths, playTime, wins }`, each `Row[]` with `Row = { id, name, value }` | every 15s and on roster changes; live roster merged with all-time Mongo top scorers |
 | `throw` | the sender's `throw` plus `id` (their `sessionId`) | to everyone except the thrower |
 | `daily` | `{ start, claimed, now, dayMs }`, or `null` after a sign-out | after a signed-in join/identify (with or without a save) |
 | `dailyClaimed` | `{ day, reward, daily }` (`daily` as above) | a `claimDaily` the server granted, after saving it |
@@ -119,13 +119,12 @@ character and fly a plane (street throws land `range` metres up the street,
 clamped to 3,500; `pad` is an index into the client's `MAP.trainingPads`;
 `dx, dz` is normalised). They never earn anything from it.
 
-Four separate boards: **level** (derived on the server from `power` using the
-client's level table in `src/progression.ts`; ties break on power),
-**playTime** (total seconds connected, **measured by the server clock** and
-`$inc`'d to Mongo every 30s and on leave — never client-reported, so
-`saveProgress` can't forge it), **power** and **wins**. Time spent while
-disconnected/reconnecting isn't counted, and guest time before signing in
-isn't either.
+Three separate boards, drawn in the client's lobby behind the Egg Row:
+**rebirths** (ties break on power), **playTime** (total seconds connected,
+**measured by the server clock** and `$inc`'d to Mongo every 30s and on leave —
+never client-reported, so `saveProgress` can't forge it) and **wins**. Time
+spent while disconnected/reconnecting isn't counted, and guest time before
+signing in isn't either.
 
 `LobbyState.players` (keyed by `sessionId`) carries `username`, `x/y/z/yaw`,
 `moveBlend`, `avatar`, `equippedPlane`, `power`, `level`, `playTime`, `wins`,
