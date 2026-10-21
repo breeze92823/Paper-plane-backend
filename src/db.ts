@@ -92,7 +92,7 @@ export async function connectDb(): Promise<void> {
       await players.createIndex({ playTime: -1 });
       await players.createIndex({ power: -1 });
       await players.createIndex({ wins: -1 });
-      await players.createIndex({ rebirths: -1 });
+      await players.createIndex({ rebirths: -1, power: -1 });
       await players.createIndex({ bestDistance: -1 });
     } catch (err) {
       console.warn("[db] failed to create leaderboard indexes:", err);

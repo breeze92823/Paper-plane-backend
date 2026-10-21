@@ -28,9 +28,10 @@ import { levelForPower } from "../progression.js";
 import { getPlayers, type PlayerDoc, type SavedPet, type X2Flags } from "../db.js";
 import { claimDaily, dailyView, freshDaily, sanitizeDaily, type DailyDoc } from "../daily.js";
 
-// One separate board per stat: Level (derived from Power), total time played,
-// Power, and Wins. Level ties break on Power in the Mongo query.
-const LEADERBOARD_STATS = ["level", "playTime", "power", "wins"] as const;
+// One separate board per stat, matching the client's three in-world boards behind the
+// Egg Row (client src/leaderboards.js): Rebirths, total time played, and Wins. Rebirth
+// ties break on Power in the Mongo query (the one closer to the next rebirth ranks first).
+const LEADERBOARD_STATS = ["rebirths", "playTime", "wins"] as const;
 type LeaderboardStat = (typeof LEADERBOARD_STATS)[number];
 type LeaderboardRow = { id: string; name: string; value: number };
 type LeaderboardPayload = Record<LeaderboardStat, LeaderboardRow[]>;
@@ -575,15 +576,14 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
         sessionId,
         userId,
         username: p.username || "Player",
-        level: p.level,
+        rebirths: p.rebirths,
         playTime: p.playTime,
-        power: p.power,
         wins: p.wins,
       });
     });
 
     const players = getPlayers();
-    const payload = { level: [], playTime: [], power: [], wins: [] } as LeaderboardPayload;
+    const payload = { rebirths: [], playTime: [], wins: [] } as LeaderboardPayload;
 
     for (const stat of LEADERBOARD_STATS) {
       // Online rows first: a connected player's live value is more current
@@ -599,7 +599,7 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
         try {
           const docs = await players
             .find({}, { projection: { _id: 1, username: 1, [stat]: 1 } })
-            .sort(stat === "level" ? { level: -1, power: -1 } : { [stat]: -1 })
+            .sort(stat === "rebirths" ? { rebirths: -1, power: -1 } : { [stat]: -1 })
             .limit(LEADERBOARD_QUERY_LIMIT)
             .toArray();
 
