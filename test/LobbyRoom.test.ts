@@ -4,8 +4,9 @@ import { ColyseusTestServer, boot } from "@colyseus/testing";
 
 import appConfig from "../src/app.config.js";
 import { LobbyState } from "../src/rooms/schema/LobbyState.js";
-import { sanitizeProgress, sanitizeThrow, type LobbyRoom } from "../src/rooms/LobbyRoom.js";
+import { resolveTutorialStep, sanitizeBoosts, sanitizeProgress, sanitizeThrow, type LobbyRoom } from "../src/rooms/LobbyRoom.js";
 import { __setPlayersForTest, type PlayerDoc } from "../src/db.js";
+import { claimDaily, DAILY_DAY_MS, DAILY_REWARDS, freshDaily, sanitizeDaily } from "../src/daily.js";
 
 // Hand-rolled fake `players` collection implementing only the subset
 // LobbyRoom.ts calls: find().sort().limit().toArray(), updateOne() (upsert),
@@ -165,6 +166,13 @@ describe("LobbyRoom", () => {
       furthestZone: 2,
       ownedPlanes: [3, 1, 42, "x", 1.5],
       equippedPlane: 3,
+      pets: [
+        { id: 1, egg: "basic", name: "Kite Cat" },
+        { id: 2, egg: "meadow", name: "Bunny" },
+      ],
+      equipped: [1],
+      discovered: ["basic:Kite Cat", "meadow:Bunny"],
+      nextPetId: 3,
     });
     await sleep(100);
 
@@ -176,6 +184,9 @@ describe("LobbyRoom", () => {
     // Starter plane is always kept, unknown/invalid indices dropped.
     assert.deepStrictEqual(saved.ownedPlanes, [0, 1, 3]);
     assert.strictEqual(saved.equippedPlane, 3);
+    assert.strictEqual(saved.pets!.length, 2);
+    assert.deepStrictEqual(saved.equipped, [1]);
+    assert.strictEqual(saved.nextPetId, 3);
 
     // A fresh session for the same account is handed the saved doc.
     // Same account joining again evicts client1 (see the eviction test). The
@@ -199,6 +210,13 @@ describe("LobbyRoom", () => {
     assert.strictEqual(progress.equippedPlane, 3);
     assert.strictEqual(progress.furthestZone, 2);
     assert.deepStrictEqual(progress.ownedPlanes, [0, 1, 3]);
+    // Pets come back with the rest of the save.
+    assert.deepStrictEqual(progress.pets, [
+      { id: 1, egg: "basic", name: "Kite Cat" },
+      { id: 2, egg: "meadow", name: "Bunny" },
+    ]);
+    assert.deepStrictEqual(progress.equipped, [1]);
+    assert.strictEqual(progress.nextPetId, 3);
     assert.strictEqual(client2.state.players.get(client2.sessionId).wins, 12);
     assert.strictEqual(client2.state.players.get(client2.sessionId).equippedPlane, 3);
   });
@@ -325,6 +343,62 @@ describe("LobbyRoom", () => {
     assert.deepStrictEqual(seenByWatcher[1], { id: thrower.sessionId, kind: "free", dx: 0.6, dz: -0.8 });
   });
 
+  describe("tutorialStep", () => {
+    it("clamps a saved step to 0..5 and ignores junk", () => {
+      assert.strictEqual(sanitizeProgress({ tutorialStep: 3.9 })!.tutorialStep, 3);
+      assert.strictEqual(sanitizeProgress({ tutorialStep: 99 })!.tutorialStep, 5);
+      assert.strictEqual(sanitizeProgress({ tutorialStep: -2 })!.tutorialStep, 0);
+      assert.strictEqual(sanitizeProgress({ tutorialStep: "4" })!.tutorialStep, undefined);
+    });
+
+    it("resolves legacy docs as finished and raises an undercounted step", () => {
+      // No stored step (predates the field) -> finished.
+      assert.strictEqual(resolveTutorialStep(baseDoc()), 5);
+      // Stored step is kept when stats don't prove more.
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 1 })), 1);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0 })), 0);
+      // ...but raised when stats prove the player is further along.
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, power: 30 })), 1);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, wins: 3 })), 2);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, ownedPlanes: [0, 1] })), 2);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, ownedPlanes: [0, 1], equippedPlane: 1 })), 3);
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, power: 229 })), 4); // level 20
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 0, rebirths: 1 })), 5);
+      // Never lowered.
+      assert.strictEqual(resolveTutorialStep(baseDoc({ tutorialStep: 4 })), 4);
+    });
+
+    it("persists it via saveProgress and sends it (or noProgress) on join", async () => {
+      const fake = fakePlayersCollection();
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      const r = room as any;
+      const sent: any[] = [];
+      const origLoad = r.loadProgress.bind(r);
+      r.loadProgress = (c: any, ...rest: any[]) => {
+        const origSend = c.send.bind(c);
+        c.send = (type: string, msg: any) => {
+          sent.push([type, msg]);
+          origSend(type, msg);
+        };
+        return origLoad(c, ...rest);
+      };
+      const first = await colyseus.connectTo(room, { userId: "tut1" });
+      await sleep(100);
+      assert.deepStrictEqual(sent[0], ["noProgress", {}]); // brand-new account
+
+      first.send("saveProgress", { power: 10, tutorialStep: 2 });
+      await sleep(80);
+      assert.strictEqual(fake.docs.get("tut1")!.tutorialStep, 2);
+
+      sent.length = 0;
+      await colyseus.connectTo(room, { userId: "tut1" }); // evicts `first`, reloads
+      await sleep(100);
+      const progress = sent.find(([t]) => t === "progress");
+      assert.strictEqual(progress[1].tutorialStep, 2);
+    });
+  });
+
   describe("sanitizeThrow", () => {
     it("accepts the three kinds and rejects junk", () => {
       assert.deepStrictEqual(sanitizeThrow({ kind: "street", range: -5 }), { kind: "street", range: 0 });
@@ -355,6 +429,208 @@ describe("LobbyRoom", () => {
       assert.strictEqual(out.bestDistance, undefined);
       assert.strictEqual(out.furthestZone, 9);
       assert.strictEqual(out.equippedPlane, undefined);
+      // No `pets` array (an older client): the pet fields are left out, not wiped.
+      assert.strictEqual(out.pets, undefined);
+      assert.strictEqual(out.equipped, undefined);
+    });
+
+    it("keeps only known pets, owned equipped ids, known discovered keys, and a next id past them", () => {
+      const out = sanitizeProgress({
+        pets: [
+          { id: 1, egg: "basic", name: "Pigeon" },
+          { id: 2, egg: "basic", name: "Dragon" }, // not in the Basic Egg
+          { id: 1, egg: "meadow", name: "Bunny" }, // duplicate id
+          { id: 7, egg: "sunset", name: "Parrot" },
+          { id: 0, egg: "basic", name: "Pigeon" }, // ids start at 1
+          { id: 3, egg: "nope", name: "Pigeon" }, // unknown egg
+          null,
+        ],
+        equipped: [7, 7, 2, 99],
+        discovered: ["basic:Pigeon", "meadow:Fairy Fox", "basic:Nope", 5, "junk"],
+        nextPetId: 3,
+      })!;
+      assert.deepStrictEqual(out.pets, [
+        { id: 1, egg: "basic", name: "Pigeon" },
+        { id: 7, egg: "sunset", name: "Parrot" },
+      ]);
+      assert.deepStrictEqual(out.equipped, [7]);
+      assert.deepStrictEqual(out.discovered!.sort(), ["basic:Pigeon", "meadow:Fairy Fox", "sunset:Parrot"]);
+      assert.strictEqual(out.nextPetId, 8);
+    });
+
+    it("caps the pet inventory and the equipped list", () => {
+      const pets = Array.from({ length: 80 }, (_, i) => ({ id: i + 1, egg: "basic", name: "Pigeon" }));
+      const out = sanitizeProgress({ pets, equipped: pets.map((p) => p.id), nextPetId: 81 })!;
+      assert.strictEqual(out.pets!.length, 60);
+      assert.strictEqual(out.equipped!.length, 10);
+      assert.strictEqual(out.nextPetId, 81);
+    });
+  });
+
+  describe("daily rewards", () => {
+    const T0 = 1_700_000_000_000;
+
+    it("unlocks a day at a time, claims each once, and starts the next cycle a week on", () => {
+      let d = freshDaily(T0);
+      assert.deepStrictEqual(claimDaily(d, 2, T0), { ok: false, daily: d, reason: "locked" });
+      assert.strictEqual((claimDaily(d, 0, T0) as any).reason, "day");
+      assert.strictEqual((claimDaily(d, "1", T0) as any).reason, "day");
+      const one = claimDaily(d, 1, T0) as any;
+      assert.ok(one.ok);
+      assert.deepStrictEqual(one.reward, DAILY_REWARDS[0]);
+      assert.deepStrictEqual(one.daily.claimed, [1]);
+      assert.deepStrictEqual(d.claimed, [], "pure: the input is untouched");
+      d = one.daily;
+      assert.strictEqual((claimDaily(d, 1, T0) as any).reason, "claimed");
+      // Day 2 opens one day in; skipped days stay claimable later, in any order.
+      for (const day of [2, 3, 4, 5, 6, 7]) {
+        const now = T0 + 6 * DAILY_DAY_MS;
+        const r = claimDaily(d, day, now) as any;
+        assert.ok(r.ok, `day ${day}`);
+        d = r.daily;
+      }
+      // All seven claimed: a new cycle whose Day 1 opens a week after the last began.
+      assert.deepStrictEqual(d, { start: T0 + 7 * DAILY_DAY_MS, claimed: [] });
+      assert.strictEqual((claimDaily(d, 1, T0 + 6.5 * DAILY_DAY_MS) as any).reason, "locked");
+    });
+
+    it("restarts a stale cycle from now rather than handing over a week at once", () => {
+      let d = freshDaily(T0);
+      for (let day = 1; day <= 7; day++) d = (claimDaily(d, day, T0 + 30 * DAILY_DAY_MS) as any).daily;
+      assert.deepStrictEqual(d, { start: T0 + 30 * DAILY_DAY_MS, claimed: [] });
+    });
+
+    it("sanitizes a stored cycle", () => {
+      assert.deepStrictEqual(sanitizeDaily(null, T0), freshDaily(T0));
+      assert.deepStrictEqual(sanitizeDaily({ start: "x" }, T0), freshDaily(T0));
+      assert.deepStrictEqual(sanitizeDaily({ start: T0 + 99, claimed: [3, 1, 3, 9, 0, 2.5, "4"] }, T0), { start: T0, claimed: [1, 3] });
+    });
+
+    it("keeps only known stored eggs and potions, as whole counts", () => {
+      const out = sanitizeProgress({
+        storedEggs: { unicorn: 2, demon: 1.5, dragonite: 4, basic: -1, sphinx: 5000 },
+        potions: { "wins:5": 3, "power:5": 0, "power:61": 1, "luck:5": 2, "power:15": 1 },
+      })!;
+      assert.deepStrictEqual(out.storedEggs, { unicorn: 2, sphinx: 999 });
+      assert.deepStrictEqual(out.potions, { "wins:5": 3, "power:15": 1 });
+      assert.strictEqual(sanitizeProgress({ wins: 1 })!.storedEggs, undefined, "absent: the saved ones stay");
+    });
+
+    it("saves stored eggs and potions and hands them back on the next sign-in", async () => {
+      const fake = fakePlayersCollection();
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      const c1 = await colyseus.connectTo(room, { userId: "items" });
+      c1.send("saveProgress", { wins: 1, storedEggs: { unicorn: 1, demon: 2 }, potions: { "wins:5": 2, "power:5": 1 } });
+      await sleep(100);
+      assert.deepStrictEqual(fake.docs.get("items")!.storedEggs, { unicorn: 1, demon: 2 });
+      let progress: any = null;
+      const r = room as any;
+      const origLoad = r.loadProgress.bind(r);
+      r.loadProgress = (c: any, ...rest: any[]) => {
+        const origSend = c.send.bind(c);
+        c.send = (type: string, msg: any) => {
+          if (type === "progress") progress = msg;
+          origSend(type, msg);
+        };
+        return origLoad(c, ...rest);
+      };
+      await colyseus.connectTo(room, { userId: "items" });
+      await sleep(100);
+      assert.deepStrictEqual(progress.storedEggs, { unicorn: 1, demon: 2 });
+      assert.deepStrictEqual(progress.potions, { "wins:5": 2, "power:5": 1 });
+    });
+
+    it("keeps x2 Power / x2 Wins flags only when exactly true", () => {
+      const out = sanitizeProgress({ x2Owned: { power: true, wins: "yes" }, x2On: { power: 1, wins: true } })!;
+      assert.deepStrictEqual(out.x2Owned, { power: true, wins: false });
+      assert.deepStrictEqual(out.x2On, { power: false, wins: true });
+      assert.strictEqual(sanitizeProgress({ wins: 1 })!.x2Owned, undefined, "absent: the saved ones stay");
+    });
+
+    it("saves x2 Power / x2 Wins and hands them back on the next sign-in", async () => {
+      const fake = fakePlayersCollection();
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      const c1 = await colyseus.connectTo(room, { userId: "x2" });
+      c1.send("saveProgress", { wins: 1, x2Owned: { power: true, wins: true }, x2On: { power: false, wins: true } });
+      await sleep(100);
+      assert.deepStrictEqual(fake.docs.get("x2")!.x2Owned, { power: true, wins: true });
+      let progress: any = null;
+      const r = room as any;
+      const origLoad = r.loadProgress.bind(r);
+      r.loadProgress = (c: any, ...rest: any[]) => {
+        const origSend = c.send.bind(c);
+        c.send = (type: string, msg: any) => {
+          if (type === "progress") progress = msg;
+          origSend(type, msg);
+        };
+        return origLoad(c, ...rest);
+      };
+      await colyseus.connectTo(room, { userId: "x2" });
+      await sleep(100);
+      assert.deepStrictEqual(progress.x2Owned, { power: true, wins: true });
+      assert.deepStrictEqual(progress.x2On, { power: false, wins: true });
+    });
+
+    it("keeps only future boosts, capped a week ahead", () => {
+      assert.deepStrictEqual(sanitizeBoosts({ power: T0 - 1, wins: T0 + 5000 }, T0), { power: 0, wins: T0 + 5000 });
+      assert.deepStrictEqual(sanitizeBoosts({ power: T0 + 99 * DAILY_DAY_MS }, T0), { power: T0 + 7 * 86_400_000, wins: 0 });
+      assert.deepStrictEqual(sanitizeBoosts("junk", T0), { power: 0, wins: 0 });
+      assert.deepStrictEqual(sanitizeProgress({ boosts: { wins: Date.now() + 1000 } })!.boosts!.power, 0);
+    });
+
+    it("claims through the room for a signed-in player, saves it, and refuses repeats and guests", async () => {
+      const fake = fakePlayersCollection([baseDoc({ _id: "d1", tutorialStep: 5 })]);
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      const c = await colyseus.connectTo(room, { userId: "d1" });
+      await sleep(100);
+      // An older doc gets its cycle saved on first load.
+      assert.ok(fake.docs.get("d1")!.daily, "cycle saved on load");
+      assert.deepStrictEqual(fake.docs.get("d1")!.daily!.claimed, []);
+
+      const got: any[] = [];
+      c.onMessage("dailyClaimed", (m: any) => got.push(["claimed", m]));
+      c.onMessage("dailyDenied", (m: any) => got.push(["denied", m]));
+      c.send("claimDaily", { day: 1 });
+      c.send("claimDaily", { day: 1 }); // a double click
+      c.send("claimDaily", { day: 2 }); // not open yet
+      await sleep(150);
+      // Exactly one grant. (The grant waits on its save, so the refusals can arrive first.)
+      assert.strictEqual(got.length, 3);
+      const claimed = got.filter(([k]) => k === "claimed").map(([, m]) => m);
+      assert.strictEqual(claimed.length, 1);
+      assert.deepStrictEqual(claimed[0].reward, DAILY_REWARDS[0]);
+      assert.deepStrictEqual(claimed[0].daily.claimed, [1]);
+      assert.strictEqual(claimed[0].daily.dayMs, DAILY_DAY_MS);
+      const reasons = got.filter(([k]) => k === "denied").map(([, m]) => m.reason).sort();
+      assert.deepStrictEqual(reasons, ["claimed", "locked"]);
+      assert.deepStrictEqual(fake.docs.get("d1")!.daily!.claimed, [1]);
+
+      // saveProgress can't touch the cycle.
+      c.send("saveProgress", { wins: 5, daily: { start: 0, claimed: [] } });
+      await sleep(100);
+      assert.deepStrictEqual(fake.docs.get("d1")!.daily!.claimed, [1]);
+
+      // A guest has no server-side calendar.
+      const guest = await colyseus.connectTo(room, {});
+      let denied: any = null;
+      guest.onMessage("dailyDenied", (m: any) => (denied = m));
+      guest.send("claimDaily", { day: 1 });
+      await sleep(100);
+      assert.strictEqual(denied?.reason, "signin");
+    });
+
+    it("starts and saves a calendar for a brand-new account without hiding its tutorial", async () => {
+      const fake = fakePlayersCollection();
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      await colyseus.connectTo(room, { userId: "newbie" });
+      await sleep(100);
+      const doc = fake.docs.get("newbie")!;
+      assert.deepStrictEqual(doc.daily!.claimed, []);
+      assert.strictEqual(resolveTutorialStep(doc), 0, "still starts the tutorial from the beginning");
     });
   });
 });

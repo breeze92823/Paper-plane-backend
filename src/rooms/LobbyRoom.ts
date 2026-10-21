@@ -13,9 +13,20 @@ import {
   PLAYTIME_FLUSH_MS,
   TRAINING_PAD_COUNT,
   THROW_MIN_INTERVAL_MS,
+  EGG_PETS,
+  PET_INVENTORY_MAX,
+  PET_SLOTS_MAX,
+  TUTORIAL_DONE_STEP,
+  TUTORIAL_POWER,
+  TUTORIAL_WINS,
+  TUTORIAL_LEVEL,
+  BOOST_MAX_MS,
+  STORED_MAX,
+  POTION_MAX_MINUTES,
 } from "../constants.js";
 import { levelForPower } from "../progression.js";
-import { getPlayers, type PlayerDoc } from "../db.js";
+import { getPlayers, type PlayerDoc, type SavedPet, type X2Flags } from "../db.js";
+import { claimDaily, dailyView, freshDaily, sanitizeDaily, type DailyDoc } from "../daily.js";
 
 // One separate board per stat: Level (derived from Power), total time played,
 // Power, and Wins. Level ties break on Power in the Mongo query.
@@ -42,6 +53,26 @@ function dedupeOnline(rows: OnlineRow[], stat: LeaderboardStat): OnlineRow[] {
   return [...byUserId.values(), ...anonymous];
 }
 
+// The furthest tutorial step the doc's own stats prove the player has already passed
+// (mirrors the client's src/tutorial.js step conditions).
+function inferMinTutorialStep(doc: PlayerDoc): number {
+  if ((doc.rebirths ?? 0) >= 1) return TUTORIAL_DONE_STEP; // past step 4 (rebirth)
+  if (levelForPower(doc.power ?? 0) >= TUTORIAL_LEVEL) return 4; // past step 3
+  if ((doc.equippedPlane ?? DEFAULT_PLANE) !== DEFAULT_PLANE) return 3; // past step 2 (new plane)
+  if ((doc.wins ?? 0) >= TUTORIAL_WINS || (doc.ownedPlanes ?? []).some((i) => i !== DEFAULT_PLANE)) return 2; // past step 1
+  if ((doc.power ?? 0) >= TUTORIAL_POWER) return 1; // past step 0
+  return 0;
+}
+
+// What loadProgress() sends down as tutorialStep. A doc predating the field reads as finished;
+// otherwise the stored step, raised to whatever the stats prove (a stored step that undercounts
+// real progress must never show the player a step they've clearly blown past). Never lowers a
+// stored step. Exported so tests can exercise the rules without a full room round trip.
+export function resolveTutorialStep(doc: PlayerDoc): number {
+  const stored = typeof doc.tutorialStep === "number" ? doc.tutorialStep : TUTORIAL_DONE_STEP;
+  return Math.min(TUTORIAL_DONE_STEP, Math.max(stored, inferMinTutorialStep(doc)));
+}
+
 // Cap on the JSON avatar blob (see LobbyState.ts PlayerState.avatar).
 const AVATAR_MAX_LEN = 4096;
 
@@ -52,6 +83,75 @@ function sanitizeAvatar(raw: unknown): string {
 function finite(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
 }
+
+const isKnownPet = (egg: unknown, name: unknown): boolean =>
+  typeof egg === "string" && typeof name === "string" && Object.hasOwn(EGG_PETS, egg) && EGG_PETS[egg].includes(name);
+
+// The pet fields of a save: known pets with unique positive integer ids (at most
+// PET_INVENTORY_MAX), equipped ids that are among them (at most PET_SLOTS_MAX), known
+// discovered keys (plus every owned pet's), and a next id past every owned one. Applied only
+// when `pets` is an array, so a payload from before eggs leaves a saved collection alone.
+export function sanitizePets(src: Record<string, unknown>): Pick<PlayerDoc, "pets" | "equipped" | "discovered" | "nextPetId"> | null {
+  if (!Array.isArray(src.pets)) return null;
+  const pets: SavedPet[] = [];
+  const ids = new Set<number>();
+  for (const raw of src.pets) {
+    if (pets.length >= PET_INVENTORY_MAX) break;
+    const p = raw as Partial<SavedPet> | null;
+    if (!p || !Number.isInteger(p.id) || (p.id as number) < 1 || ids.has(p.id as number) || !isKnownPet(p.egg, p.name)) continue;
+    ids.add(p.id as number);
+    pets.push({ id: p.id as number, egg: p.egg as string, name: p.name as string });
+  }
+  const equipped: number[] = [];
+  if (Array.isArray(src.equipped)) {
+    for (const id of src.equipped) {
+      if (equipped.length >= PET_SLOTS_MAX) break;
+      if (Number.isInteger(id) && ids.has(id) && !equipped.includes(id)) equipped.push(id);
+    }
+  }
+  const discovered = new Set<string>();
+  if (Array.isArray(src.discovered)) {
+    for (const key of src.discovered) {
+      if (typeof key !== "string") continue;
+      const at = key.indexOf(":");
+      if (at > 0 && isKnownPet(key.slice(0, at), key.slice(at + 1))) discovered.add(key);
+    }
+  }
+  for (const p of pets) discovered.add(`${p.egg}:${p.name}`);
+  const maxId = pets.reduce((m, p) => Math.max(m, p.id), 0);
+  const next = Number.isInteger(src.nextPetId) ? (src.nextPetId as number) : 1;
+  return { pets, equipped, discovered: [...discovered], nextPetId: Math.max(maxId + 1, Math.min(next, Number.MAX_SAFE_INTEGER)) };
+}
+
+// Timed x2 boosts as epoch ms each runs until: only future ones, at most BOOST_MAX_MS ahead.
+export function sanitizeBoosts(raw: unknown, now: number): { power: number; wins: number } {
+  const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const until = (v: unknown) => (finite(v) && v > now ? Math.min(v, now + BOOST_MAX_MS) : 0);
+  return { power: until(src.power), wins: until(src.wins) };
+}
+
+// x2 Power / x2 Wins flags (owned, or switched on): true only when sent as exactly true.
+export function sanitizeX2(raw: unknown): X2Flags {
+  const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  return { power: src.power === true, wins: src.wins === true };
+}
+
+// Stored items: known keys only, whole positive counts capped at STORED_MAX.
+function sanitizeCounts(raw: unknown, ok: (key: string) => boolean): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [key, n] of Object.entries(raw as Record<string, unknown>)) {
+    if (ok(key) && Number.isInteger(n) && (n as number) > 0) out[key] = Math.min(STORED_MAX, n as number);
+  }
+  return out;
+}
+const isStoredEgg = (key: string) => Object.hasOwn(EGG_PETS, key);
+const isPotion = (key: string) => {
+  const m = /^(power|wins):(\d+)$/.exec(key);
+  return !!m && Number(m[2]) >= 1 && Number(m[2]) <= POTION_MAX_MINUTES;
+};
+export const sanitizeStoredEggs = (raw: unknown) => sanitizeCounts(raw, isStoredEgg);
+export const sanitizePotions = (raw: unknown) => sanitizeCounts(raw, isPotion);
 
 // A plane is its index into the client's MAP.pads.
 function isPlane(v: unknown): v is number {
@@ -82,6 +182,19 @@ export function sanitizeProgress(raw: unknown): Partial<PlayerDoc> | null {
     out.ownedPlanes = [...owned].sort((a, b) => a - b);
   }
   if (isPlane(src.equippedPlane)) out.equippedPlane = src.equippedPlane;
+  // Only ever moves forward on the client (store.js advanceTutorial), so a save can safely take
+  // whatever is sent, clamped to the valid range.
+  if (finite(src.tutorialStep)) {
+    out.tutorialStep = Math.min(TUTORIAL_DONE_STEP, Math.max(0, Math.floor(src.tutorialStep)));
+  }
+  if (typeof src.autoThrowOwned === "boolean") out.autoThrowOwned = src.autoThrowOwned;
+  if (src.x2Owned && typeof src.x2Owned === "object") out.x2Owned = sanitizeX2(src.x2Owned);
+  if (src.x2On && typeof src.x2On === "object") out.x2On = sanitizeX2(src.x2On);
+  const pets = sanitizePets(src);
+  if (pets) Object.assign(out, pets);
+  if (src.boosts && typeof src.boosts === "object") out.boosts = sanitizeBoosts(src.boosts, Date.now());
+  if (src.storedEggs && typeof src.storedEggs === "object") out.storedEggs = sanitizeStoredEggs(src.storedEggs);
+  if (src.potions && typeof src.potions === "object") out.potions = sanitizePotions(src.potions);
   return out;
 }
 
@@ -133,6 +246,10 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
 
   // sessionId -> epoch ms of its last relayed throw (THROW_MIN_INTERVAL_MS). Not synced.
   private lastThrowAt = new Map<string, number>();
+
+  // sessionId -> that signed-in account's daily-reward cycle (src/daily.ts), loaded with its
+  // progress. Guests never get one: the client keeps theirs. Not synced.
+  private daily = new Map<string, DailyDoc>();
 
   messages = {
     // Throttled client-side -- not sent every physics frame.
@@ -204,6 +321,39 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
         console.warn("[LobbyRoom] saveProgress failed", err);
       }
     },
+    // Claims one day of this account's daily rewards. The server checks the day is unlocked
+    // and unclaimed and saves the claim before telling the client what to grant, so a reward
+    // is never handed out twice -- not by a double click, a second tab or a reload.
+    claimDaily: async (client: Client, msg: { day?: unknown }) => {
+      const day = msg?.day;
+      const d = this.daily.get(client.sessionId);
+      if (!d) {
+        client.send("dailyDenied", { day, reason: "signin" });
+        return;
+      }
+      const now = Date.now();
+      const res = claimDaily(d, day, now);
+      if ("reason" in res) {
+        client.send("dailyDenied", { day, reason: res.reason, daily: dailyView(d, now) });
+        return;
+      }
+      // Recorded before any await, so a second claim racing this one sees it.
+      this.daily.set(client.sessionId, res.daily);
+      const userId = this.userIds.get(client.sessionId);
+      const players = getPlayers();
+      if (userId && players) {
+        try {
+          await players.updateOne(
+            { _id: userId },
+            { $set: { daily: res.daily, updatedAt: new Date() }, $setOnInsert: { version: 1, tutorialStep: 0 } },
+            { upsert: true },
+          );
+        } catch (err) {
+          console.warn("[LobbyRoom] daily claim save failed", err);
+        }
+      }
+      client.send("dailyClaimed", { day, reward: res.reward, daily: dailyView(res.daily, Date.now()) });
+    },
     // Re-states identity after a login/logout that happens AFTER join (a guest
     // who signs in mid-session). Without this a late sign-in would never get
     // a userId and saveProgress would no-op for the whole session.
@@ -260,6 +410,7 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
     this.flushPlaytime(sessionId);
     this.playTimeMark.delete(sessionId);
     this.lastThrowAt.delete(sessionId);
+    this.daily.delete(sessionId);
     this.state.players.delete(sessionId);
     this.userIds.delete(sessionId);
   }
@@ -302,11 +453,14 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
         }
       }
       this.userIds.set(client.sessionId, userId);
+      this.daily.delete(client.sessionId); // until this account's own cycle has loaded
       void this.loadProgress(client, userId, p);
     } else {
       // Logged out: stop persisting for this connection. The client flushes a
       // final saveProgress under the OLD id before sending this.
       this.userIds.delete(client.sessionId);
+      this.daily.delete(client.sessionId);
+      client.send("daily", null); // back to the client's own (guest) calendar
     }
 
     void this.refreshLeaderboard();
@@ -318,13 +472,26 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
   // the client on its own defaults.
   private async loadProgress(client: Client, userId: string, p: PlayerState) {
     const players = getPlayers();
-    if (!players) return;
+    if (!players) {
+      // Nowhere to keep it: a cycle for this connection only.
+      this.setDaily(client, freshDaily(Date.now()));
+      return;
+    }
     try {
       const doc = await players.findOne({ _id: userId });
+      if (this.userIds.get(client.sessionId) !== userId) return; // signed out/switched meanwhile
       if (!doc) {
         // A brand-new account: tell the client there's nothing to load so it
-        // can start fresh right away instead of waiting on a timeout.
+        // can start fresh (tutorial at step 0) right away instead of waiting on a timeout.
         client.send("noProgress", {});
+        // Its calendar starts now, saved so it doesn't restart on the next visit.
+        const daily = freshDaily(Date.now());
+        this.setDaily(client, daily);
+        await players.updateOne(
+          { _id: userId },
+          { $set: { daily, updatedAt: new Date() }, $setOnInsert: { version: 1, tutorialStep: 0 } },
+          { upsert: true },
+        );
         return;
       }
       p.power = doc.power ?? 0;
@@ -348,10 +515,30 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
         furthestZone: doc.furthestZone ?? 0,
         ownedPlanes,
         equippedPlane,
+        tutorialStep: resolveTutorialStep(doc),
+        autoThrowOwned: doc.autoThrowOwned === true,
+        x2Owned: sanitizeX2(doc.x2Owned),
+        x2On: sanitizeX2(doc.x2On),
+        // Re-sanitized on the way out too, so an older or hand-edited doc can't hand the
+        // client pets it doesn't know.
+        ...(sanitizePets({ pets: doc.pets ?? [], equipped: doc.equipped, discovered: doc.discovered, nextPetId: doc.nextPetId }) ?? {}),
+        boosts: sanitizeBoosts(doc.boosts, Date.now()),
+        storedEggs: sanitizeStoredEggs(doc.storedEggs),
+        potions: sanitizePotions(doc.potions),
       });
+      const daily = sanitizeDaily(doc.daily, Date.now());
+      this.setDaily(client, daily);
+      // A doc from before daily rewards: save its cycle's start (only if still missing).
+      if (!doc.daily) await players.updateOne({ _id: userId, daily: { $exists: false } } as any, { $set: { daily } });
     } catch (err) {
       console.warn("[LobbyRoom] loadProgress failed", err);
     }
+  }
+
+  // Sets this signed-in session's daily cycle and sends it down.
+  private setDaily(client: Client, d: DailyDoc) {
+    this.daily.set(client.sessionId, d);
+    client.send("daily", dailyView(d, Date.now()));
   }
 
   // A deliberate `room.leave()` closes with CONSENTED -- drop the player at

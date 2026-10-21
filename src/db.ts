@@ -1,4 +1,5 @@
 import { MongoClient, type Collection } from "mongodb";
+import type { DailyDoc } from "./daily.js";
 
 // Bloxity Legion hosting injects MONGODB_URI per game+channel -- an isolated
 // database with scoped credentials, no provisioning. A local `npm start`
@@ -26,8 +27,45 @@ export interface PlayerDoc {
   furthestZone: number; // index into the client's STREET_ZONES
   ownedPlanes: number[]; // indices into the client's MAP.pads
   equippedPlane: number;
+  // Pets from eggs (client src/store.js): hatched pets, the equipped ones' ids, every
+  // `${egg}:${name}` ever hatched, and the next id to hand out. Older docs lack them.
+  pets?: SavedPet[];
+  equipped?: number[];
+  discovered?: string[];
+  nextPetId?: number;
+  // Onboarding progress (client src/tutorial.js), 0..TUTORIAL_DONE_STEP. Docs from before the
+  // tutorial lack it; LobbyRoom.ts resolveTutorialStep reads those as finished.
+  tutorialStep?: number;
+  // Auto Throw bought with Wins (client src/store.js). Older docs lack it (= not owned).
+  autoThrowOwned?: boolean;
+  // The HUD's x2 Power / x2 Wins (client src/store.js): bought once with Wins, then switched
+  // on or off. Older docs lack them (= not owned).
+  x2Owned?: X2Flags;
+  x2On?: X2Flags;
+  // Daily rewards (src/daily.ts): this cycle's start and the days claimed. Written by the
+  // server only (claimDaily), never by saveProgress. Older docs lack it.
+  daily?: DailyDoc;
+  // Timed x2 boosts from daily rewards: epoch ms each runs until (0 / past = off). Client-
+  // reported through saveProgress, capped at BOOST_MAX_MS ahead. Older docs lack it.
+  boosts?: { power?: number; wins?: number };
+  // The Items window's stored eggs (by EGG_PETS id) and potions (`${stat}:${minutes}`) -> count.
+  // Client-reported through saveProgress. Older docs lack them.
+  storedEggs?: Record<string, number>;
+  potions?: Record<string, number>;
   version: number;
   updatedAt: Date;
+}
+
+export interface X2Flags {
+  power: boolean;
+  wins: boolean;
+}
+
+// One hatched pet: a per-save id, the egg it came from and its name (constants.ts EGG_PETS).
+export interface SavedPet {
+  id: number;
+  egg: string;
+  name: string;
 }
 
 let client: MongoClient | null = null;
