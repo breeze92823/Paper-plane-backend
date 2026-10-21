@@ -52,6 +52,9 @@ export interface PlayerDoc {
   // Client-reported through saveProgress. Older docs lack them.
   storedEggs?: Record<string, number>;
   potions?: Record<string, number>;
+  // Been through the lobby portal to the Ice World (client src/worlds.js): from then on the
+  // portal lets this account in whatever its Power. Only ever set true. Older docs lack it.
+  world2Unlocked?: boolean;
   version: number;
   updatedAt: Date;
 }

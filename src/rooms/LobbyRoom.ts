@@ -23,6 +23,8 @@ import {
   BOOST_MAX_MS,
   STORED_MAX,
   POTION_MAX_MINUTES,
+  WORLD_IDS,
+  type WorldId,
 } from "../constants.js";
 import { levelForPower } from "../progression.js";
 import { getPlayers, type PlayerDoc, type SavedPet, type X2Flags } from "../db.js";
@@ -73,6 +75,16 @@ export function resolveTutorialStep(doc: PlayerDoc): number {
   const stored = typeof doc.tutorialStep === "number" ? doc.tutorialStep : TUTORIAL_DONE_STEP;
   return Math.min(TUTORIAL_DONE_STEP, Math.max(stored, inferMinTutorialStep(doc)));
 }
+
+// A join's `world` option: one of WORLD_IDS, anything else (or none) the lobby.
+export function sanitizeWorld(raw: unknown): WorldId {
+  return (WORLD_IDS as readonly unknown[]).includes(raw) ? (raw as WorldId) : 1;
+}
+
+// Bloxity user id -> the room holding that account's live session, across every world's
+// room, so one account is never live in two at once (a tab that has just travelled while its
+// old socket lingers on reconnect, or two tabs in different worlds).
+const liveAccounts = new Map<string, LobbyRoom>();
 
 // Cap on the JSON avatar blob (see LobbyState.ts PlayerState.avatar).
 const AVATAR_MAX_LEN = 4096;
@@ -196,6 +208,8 @@ export function sanitizeProgress(raw: unknown): Partial<PlayerDoc> | null {
   if (src.boosts && typeof src.boosts === "object") out.boosts = sanitizeBoosts(src.boosts, Date.now());
   if (src.storedEggs && typeof src.storedEggs === "object") out.storedEggs = sanitizeStoredEggs(src.storedEggs);
   if (src.potions && typeof src.potions === "object") out.potions = sanitizePotions(src.potions);
+  // An unlock is never taken back by a save, so only `true` is written.
+  if (src.world2Unlocked === true) out.world2Unlocked = true;
   return out;
 }
 
@@ -228,13 +242,17 @@ export function sanitizeThrow(raw: unknown): ThrowMsg | null {
 }
 
 /**
- * Single global room every client joins via `client.joinOrCreate("lobby")`.
+ * One room per world (app.config.ts filterBy) that every client joins via
+ * `client.joinOrCreate("lobby", { world })`; saves and leaderboards are shared by all.
  * Clients report events (as they already do locally against src/store.js);
  * this room relays/stores them so other clients see them too. No server-side
  * gameplay validation.
  */
 export class LobbyRoom extends Room<{ state: LobbyState }> {
   state = new LobbyState();
+
+  // Which world this room is (its creating join's `world` option).
+  world: WorldId = 1;
 
   // sessionId -> Bloxity user id, for whichever connected clients are signed
   // in. Deliberately NOT part of LobbyState: it has no reason to be broadcast,
@@ -300,13 +318,19 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
     },
     // Debounced push of the durable half of the client store. A guest has no
     // userId and this no-ops. Upserts, so a first save creates the document.
+    // `ack: true` (a save right before the client travels to another world) is answered
+    // with `progressSaved` once written ({ saved: false } when nothing could be).
     saveProgress: async (client: Client, msg: unknown) => {
+      const ack = (msg as { ack?: unknown } | null)?.ack === true;
+      const reply = (saved: boolean) => {
+        if (ack) client.send("progressSaved", { saved });
+      };
       const userId = this.userIds.get(client.sessionId);
-      if (!userId) return;
+      if (!userId) return reply(false);
       const players = getPlayers();
-      if (!players) return; // Mongo unset/unreachable -- degrade silently
+      if (!players) return reply(false); // Mongo unset/unreachable -- degrade silently
       const patch = sanitizeProgress(msg);
-      if (!patch) return;
+      if (!patch) return reply(false);
       // Display name comes from this connection's own PlayerState, not `msg`.
       const p = this.state.players.get(client.sessionId);
       try {
@@ -318,8 +342,10 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
           },
           { upsert: true },
         );
+        reply(true);
       } catch (err) {
         console.warn("[LobbyRoom] saveProgress failed", err);
+        reply(false);
       }
     },
     // Claims one day of this account's daily rewards. The server checks the day is unlocked
@@ -368,12 +394,19 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
 
   // Runs once immediately -- a fresh room shouldn't sit on an empty board for
   // a full LEADERBOARD_REFRESH_MS -- then on a timer.
-  onCreate() {
+  onCreate(options?: { world?: unknown }) {
+    this.world = sanitizeWorld(options?.world);
+    void this.setMetadata({ world: this.world });
     void this.refreshLeaderboard();
     this.clock.setInterval(() => {
       void this.refreshLeaderboard();
     }, LEADERBOARD_REFRESH_MS);
     this.clock.setInterval(() => this.flushAllPlaytime(), PLAYTIME_FLUSH_MS);
+  }
+
+  // Whatever accounts were still claimed here go with the room.
+  onDispose() {
+    for (const [userId, room] of liveAccounts) if (room === this) liveAccounts.delete(userId);
   }
 
   // Adds the seconds elapsed since this session's last mark to its live
@@ -413,7 +446,32 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
     this.lastThrowAt.delete(sessionId);
     this.daily.delete(sessionId);
     this.state.players.delete(sessionId);
+    const userId = this.userIds.get(sessionId);
     this.userIds.delete(sessionId);
+    if (userId) this.releaseAccount(userId);
+  }
+
+  // Forgets `userId`'s cross-room claim if it's this room's and no session here still holds it.
+  private releaseAccount(userId: string) {
+    if (liveAccounts.get(userId) !== this) return;
+    for (const uid of this.userIds.values()) if (uid === userId) return;
+    liveAccounts.delete(userId);
+  }
+
+  // Drops every session in this room signed in as `userId` (but `keep`), closing its socket.
+  evictAccount(userId: string, keep = "") {
+    for (const [sid, uid] of [...this.userIds]) {
+      if (sid === keep || uid !== userId) continue;
+      this.forgetSession(sid);
+      const stale = this.clients.find((c) => c.sessionId === sid);
+      if (stale) {
+        try {
+          stale.leave(CloseCode.CONSENTED);
+        } catch {
+          // Already gone -- nothing to clean up.
+        }
+      }
+    }
   }
 
   onJoin(client: Client, options?: { username?: string; avatar?: string; userId?: string }) {
@@ -437,29 +495,24 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
     const prev = this.userIds.get(client.sessionId) || "";
     if (userId === prev) return; // no change -- e.g. a username-only identify
 
+    if (prev) {
+      this.userIds.delete(client.sessionId);
+      this.releaseAccount(prev);
+    }
     if (userId) {
-      // Evict any OTHER live session already claiming this account, so one
-      // account never shows as two leaderboard rows / two racing Mongo writers
-      // (a crashed tab lingers up to 20s via allowReconnection in onLeave).
-      for (const [sid, uid] of this.userIds) {
-        if (sid === client.sessionId || uid !== userId) continue;
-        this.forgetSession(sid);
-        const stale = this.clients.find((c) => c.sessionId === sid);
-        if (stale) {
-          try {
-            stale.leave(CloseCode.CONSENTED);
-          } catch {
-            // Already gone -- nothing to clean up.
-          }
-        }
-      }
+      // Evict any OTHER live session already claiming this account, here or in another
+      // world's room, so one account never shows as two leaderboard rows / two racing Mongo
+      // writers (a crashed tab lingers up to 20s via allowReconnection in onLeave).
+      this.evictAccount(userId, client.sessionId);
+      const elsewhere = liveAccounts.get(userId);
+      if (elsewhere && elsewhere !== this) elsewhere.evictAccount(userId);
+      liveAccounts.set(userId, this);
       this.userIds.set(client.sessionId, userId);
       this.daily.delete(client.sessionId); // until this account's own cycle has loaded
       void this.loadProgress(client, userId, p);
     } else {
       // Logged out: stop persisting for this connection. The client flushes a
       // final saveProgress under the OLD id before sending this.
-      this.userIds.delete(client.sessionId);
       this.daily.delete(client.sessionId);
       client.send("daily", null); // back to the client's own (guest) calendar
     }
@@ -526,6 +579,7 @@ export class LobbyRoom extends Room<{ state: LobbyState }> {
         boosts: sanitizeBoosts(doc.boosts, Date.now()),
         storedEggs: sanitizeStoredEggs(doc.storedEggs),
         potions: sanitizePotions(doc.potions),
+        world2Unlocked: doc.world2Unlocked === true,
       });
       const daily = sanitizeDaily(doc.daily, Date.now());
       this.setDaily(client, daily);

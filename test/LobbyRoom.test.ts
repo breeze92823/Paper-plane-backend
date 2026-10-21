@@ -4,7 +4,7 @@ import { ColyseusTestServer, boot } from "@colyseus/testing";
 
 import appConfig from "../src/app.config.js";
 import { LobbyState } from "../src/rooms/schema/LobbyState.js";
-import { resolveTutorialStep, sanitizeBoosts, sanitizeProgress, sanitizeThrow, type LobbyRoom } from "../src/rooms/LobbyRoom.js";
+import { resolveTutorialStep, sanitizeBoosts, sanitizeProgress, sanitizeThrow, sanitizeWorld, type LobbyRoom } from "../src/rooms/LobbyRoom.js";
 import { __setPlayersForTest, type PlayerDoc } from "../src/db.js";
 import { claimDaily, DAILY_DAY_MS, DAILY_REWARDS, freshDaily, sanitizeDaily } from "../src/daily.js";
 
@@ -632,6 +632,85 @@ describe("LobbyRoom", () => {
       const doc = fake.docs.get("newbie")!;
       assert.deepStrictEqual(doc.daily!.claimed, []);
       assert.strictEqual(resolveTutorialStep(doc), 0, "still starts the tutorial from the beginning");
+    });
+  });
+  describe("worlds", () => {
+    it("reads a join's world as 1 or 2, anything else as the lobby", () => {
+      assert.strictEqual(sanitizeWorld(2), 2);
+      assert.strictEqual(sanitizeWorld(1), 1);
+      for (const junk of [undefined, 0, 3, "2", 2.5, null]) assert.strictEqual(sanitizeWorld(junk), 1);
+    });
+
+    it("keeps one room per world and matches joins to their own world's room", async () => {
+      const a = await colyseus.sdk.joinOrCreate("lobby", { world: 1 });
+      const b = await colyseus.sdk.joinOrCreate("lobby", { world: 2 });
+      const c = await colyseus.sdk.joinOrCreate("lobby", { world: 2 });
+      assert.notStrictEqual(a.roomId, b.roomId);
+      assert.strictEqual(b.roomId, c.roomId);
+      await Promise.all([a.leave(), b.leave(), c.leave()]);
+    });
+
+    it("only ever saves the Ice World unlock as true, and hands it back on sign-in", async () => {
+      assert.strictEqual(sanitizeProgress({ world2Unlocked: true })!.world2Unlocked, true);
+      for (const v of [false, "true", 1]) assert.strictEqual(sanitizeProgress({ world2Unlocked: v })!.world2Unlocked, undefined);
+
+      const fake = fakePlayersCollection();
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      const c1 = await colyseus.connectTo(room, { userId: "icy" });
+      c1.send("saveProgress", { wins: 1, world2Unlocked: true });
+      await sleep(100);
+      c1.send("saveProgress", { wins: 2, world2Unlocked: false });
+      await sleep(100);
+      assert.strictEqual(fake.docs.get("icy")!.world2Unlocked, true);
+      let progress: any = null;
+      const r = room as any;
+      const origLoad = r.loadProgress.bind(r);
+      r.loadProgress = (c: any, ...rest: any[]) => {
+        const origSend = c.send.bind(c);
+        c.send = (type: string, msg: any) => {
+          if (type === "progress") progress = msg;
+          origSend(type, msg);
+        };
+        return origLoad(c, ...rest);
+      };
+      await colyseus.connectTo(room, { userId: "icy" });
+      await sleep(100);
+      assert.strictEqual(progress.world2Unlocked, true);
+    });
+
+    it("answers a save sent with ack once it's written, and a guest's at once with saved: false", async () => {
+      const fake = fakePlayersCollection();
+      __setPlayersForTest(fake);
+      const room = await colyseus.createRoom<LobbyState>("lobby", {});
+      const pilot = await colyseus.connectTo(room, { userId: "ack" });
+      const guest = await colyseus.connectTo(room, {});
+      const got: Record<string, any> = {};
+      pilot.onMessage("progressSaved", (m: any) => (got.pilot = m));
+      guest.onMessage("progressSaved", (m: any) => (got.guest = m));
+      pilot.send("saveProgress", { wins: 9, ack: true });
+      guest.send("saveProgress", { wins: 9, ack: true });
+      await sleep(100);
+      assert.deepStrictEqual(got.pilot, { saved: true });
+      assert.deepStrictEqual(got.guest, { saved: false });
+      assert.strictEqual(fake.docs.get("ack")!.wins, 9);
+      // No ack asked, no reply.
+      got.pilot = null;
+      pilot.send("saveProgress", { wins: 10 });
+      await sleep(100);
+      assert.strictEqual(got.pilot, null);
+    });
+
+    it("evicts an account's session in the other world's room when it signs in here", async () => {
+      const lobby = await colyseus.createRoom<LobbyState>("lobby", { world: 1 });
+      const ice = await colyseus.createRoom<LobbyState>("lobby", { world: 2 });
+      const before = await colyseus.connectTo(lobby, { userId: "traveller" });
+      const after = await colyseus.connectTo(ice, { userId: "traveller" });
+      await sleep(50);
+      assert.strictEqual(lobby.state.players.has(before.sessionId), false);
+      assert.strictEqual((lobby as unknown as LobbyRoom).userIds.size, 0);
+      assert.strictEqual((ice as unknown as LobbyRoom).userIds.get(after.sessionId), "traveller");
+      assert.strictEqual((ice as unknown as LobbyRoom).world, 2);
     });
   });
 });
