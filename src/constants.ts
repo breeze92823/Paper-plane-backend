@@ -23,6 +23,11 @@ export const POWER_MAX = 1_000_000_000_000;
 export const REBIRTH_MAX = 5000;
 export const WINS_MAX = Number.MAX_SAFE_INTEGER;
 
+// Client src/config.js's WORLDS: 1 is the lobby, 2 the Ice World. A join names its world and
+// each gets its own room (app.config.ts filterBy); anything else is read as the lobby.
+export const WORLD_IDS = [1, 2] as const;
+export type WorldId = (typeof WORLD_IDS)[number];
+
 // Client src/config.js's STREET.length: metres from the Throw Area to the far
 // end, so no throw can land further. bestDistance is clamped to it.
 export const STREET_LENGTH = 3500;

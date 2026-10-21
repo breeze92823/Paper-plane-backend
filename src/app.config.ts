@@ -10,7 +10,10 @@ import { LobbyRoom } from "./rooms/LobbyRoom.js";
 
 const server = defineServer({
   rooms: {
-    lobby: defineRoom(LobbyRoom),
+    // One room per world: a join's `world` option (client src/config.js WORLD) only ever
+    // matches a room created for the same world, so the lobby and the Ice World each see
+    // just their own players.
+    lobby: defineRoom(LobbyRoom).filterBy(["world"]),
   },
 
   express: (app) => {
